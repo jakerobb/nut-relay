@@ -96,6 +96,10 @@ func parseVars(vars nut.VarMap, label, upsName string) *store.UpsStats {
 			s.OutputPower = parseFloat(v)
 		case "output.frequency":
 			s.OutputFrequency = parseFloat(v)
+		case "ups.realpower":
+			s.RealPower = parseFloat(v)
+		case "ups.power":
+			s.ApparentPower = parseFloat(v)
 		case "ups.status":
 			s.Status = strings.TrimSpace(v)
 		case "ups.load":
