@@ -29,6 +29,10 @@ type UpsStats struct {
 	OutputPower     *float64 `json:"output_power"`
 	OutputFrequency *float64 `json:"output_frequency"`
 
+	// Power
+	RealPower     *float64 `json:"real_power_watts"`
+	ApparentPower *float64 `json:"apparent_power_va"`
+
 	// UPS
 	Status       string   `json:"status"` // raw NUT ups.status, e.g. "OL CHRG"
 	Load         *float64 `json:"load_percent"`

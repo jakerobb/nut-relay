@@ -135,6 +135,12 @@ func BuildLine(measurement string, stats *store.UpsStats) string {
 	if stats.OutputFrequency != nil {
 		fields = append(fields, fmt.Sprintf("output_frequency=%g", *stats.OutputFrequency))
 	}
+	if stats.ApparentPower != nil {
+		fields = append(fields, fmt.Sprintf("apparent_power_va=%g", *stats.ApparentPower))
+	}
+	if stats.RealPower != nil {
+		fields = append(fields, fmt.Sprintf("real_power_watts=%g", *stats.RealPower))
+	}
 
 	// String field: ups_status
 	if stats.Status != "" {
