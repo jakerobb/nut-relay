@@ -1,0 +1,12 @@
+# Build output
+/src/nut-influx-relay
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+#Other
+CLAUDE.md
+settings.local.json
