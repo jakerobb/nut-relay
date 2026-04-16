@@ -3,7 +3,6 @@ package main
 import (
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/jakerobb/nut-influx-relay/internal/api"
 	"github.com/jakerobb/nut-influx-relay/internal/collector"
@@ -15,25 +14,14 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "/etc/nut-influx-relay/config.yaml"
-	}
-
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("failed to load config", "path", configPath, "err", err)
-		os.Exit(1)
-	}
-
-	pollInterval, err := time.ParseDuration(cfg.PollInterval)
-	if err != nil {
-		slog.Error("invalid poll_interval", "value", cfg.PollInterval, "err", err)
+		slog.Error("failed to load config", "err", err)
 		os.Exit(1)
 	}
 
 	slog.Info("configuration loaded",
-		"poll_interval", pollInterval,
+		"poll_interval", cfg.PollInterval,
 		"http_port", cfg.HTTPPort,
 		"influxdb_url", cfg.InfluxDB.URL,
 		"ups_count", len(cfg.UPSes),
@@ -60,7 +48,7 @@ func main() {
 	)
 
 	for _, upsCfg := range cfg.UPSes {
-		c := collector.New(upsCfg, s, writer, pollInterval)
+		c := collector.New(upsCfg, s, writer, cfg.PollInterval)
 		c.Start()
 	}
 

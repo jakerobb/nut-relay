@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
 
 // VarMap is a map of NUT variable names to their string values.
@@ -30,7 +32,7 @@ func FetchVars(host string, port int, upsName string, useTLS bool, tlsSkipVerify
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
 	}
-	defer conn.Close()
+	defer util.CloseCleanly(conn)
 
 	r := bufio.NewReader(conn)
 

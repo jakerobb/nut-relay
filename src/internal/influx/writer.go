@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jakerobb/nut-influx-relay/internal/store"
+	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
 
 // statusFlagMap maps NUT status tokens to their flag values (matching inputs.upsd convention).
@@ -68,7 +69,7 @@ func (w *Writer) Write(stats *store.UpsStats) error {
 	if err != nil {
 		return fmt.Errorf("posting to influxdb: %w", err)
 	}
-	defer resp.Body.Close()
+	defer util.CloseCleanly(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("influxdb returned %d", resp.StatusCode)

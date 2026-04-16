@@ -4,15 +4,17 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	PollInterval string      `yaml:"poll_interval"`
-	HTTPPort     int         `yaml:"http_port"`
-	InfluxDB     InfluxDB    `yaml:"influxdb"`
-	UPSes        []UPSConfig `yaml:"upses"`
+	HTTPPort           int         `yaml:"http_port"`
+	InfluxDB           InfluxDB    `yaml:"influxdb"`
+	UPSes              []UPSConfig `yaml:"upses"`
+	PollIntervalString string      `yaml:"poll_interval"`
+	PollInterval       *time.Duration
 }
 
 type InfluxDB struct {
@@ -34,7 +36,7 @@ type UPSConfig struct {
 	Password      string `yaml:"password"`
 }
 
-var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
+var envVarRe = regexp.MustCompile(`\$\{([^}]+)}`)
 
 // interpolate replaces ${VAR_NAME} references with environment variable values.
 func interpolate(s string) string {
@@ -53,30 +55,45 @@ func (c *Config) interpolateEnvVars() {
 	}
 }
 
-func Load(path string) (*Config, error) {
+func Load() (*Config, error) {
+	path := os.Getenv("CONFIG_PATH")
+	if path == "" {
+		path = "/etc/nut-influx-relay/config.yaml"
+	}
+
+	return LoadFromPath(path)
+}
+
+func LoadFromPath(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading config: %w", err)
+		return nil, fmt.Errorf("reading config from path %s: %w", path, err)
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
+		return nil, fmt.Errorf("parsing config from path %s: %w", path, err)
 	}
 
 	cfg.interpolateEnvVars()
 
 	if err := validate(&cfg); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+		return nil, fmt.Errorf("invalid config from path %s: %w", path, err)
 	}
 
 	return &cfg, nil
 }
 
 func validate(cfg *Config) error {
-	if cfg.PollInterval == "" {
+	if cfg.PollIntervalString == "" {
 		return fmt.Errorf("poll_interval is required")
 	}
+	pollInterval, err := time.ParseDuration(cfg.PollIntervalString)
+	if err != nil {
+		return fmt.Errorf("invalid poll_interval `%s`: %w", cfg.PollInterval, err)
+	}
+	cfg.PollInterval = &pollInterval
+
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}

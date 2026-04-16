@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/jakerobb/nut-influx-relay/internal/store"
@@ -33,7 +34,10 @@ func (srv *Server) Start() error {
 func (srv *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+	_, err := w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+	if err != nil {
+		slog.Error("failed to write health response", "err", err)
+	}
 }
 
 func (srv *Server) handleUPSList(w http.ResponseWriter, _ *http.Request) {
@@ -65,5 +69,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
-	enc.Encode(v) //nolint:errcheck
+	err := enc.Encode(v)
+	if err != nil {
+		slog.Error("failed to encode JSON response", "err", err)
+	}
 }

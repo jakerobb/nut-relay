@@ -3,9 +3,12 @@ package nut
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
+
+	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
 
 func TestParseVarLine(t *testing.T) {
@@ -74,14 +77,14 @@ func TestParseVarLine(t *testing.T) {
 
 // startFakeNUTServer starts a TCP server that simulates a NUT server for testing.
 // It returns the listener address and a channel that signals shutdown.
-func startFakeNUTServer(t *testing.T, upsName string, vars map[string]string, requireAuth bool) string {
+func startFakeNUTServer(t *testing.T, upsName string, vars map[string]string, requireAuth bool) (string, int, error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { util.CloseCleanly(ln) })
 
 	go func() {
 		for {
@@ -93,15 +96,24 @@ func startFakeNUTServer(t *testing.T, upsName string, vars map[string]string, re
 		}
 	}()
 
-	return ln.Addr().String()
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port := 0
+	_, err = fmt.Sscanf(portStr, "%d", &port)
+	if err != nil {
+		slog.Error("failed to parse port", "input", portStr, "err", err)
+	}
+	return host, port, err
 }
 
 func handleFakeNUT(conn net.Conn, upsName string, vars map[string]string, requireAuth bool) {
-	defer conn.Close()
+	defer util.CloseCleanly(conn)
 	r := bufio.NewReader(conn)
 
 	send := func(s string) {
-		fmt.Fprintf(conn, "%s\n", s)
+		_, err := fmt.Fprintf(conn, "%s\n", s)
+		if err != nil {
+			slog.Error("failed to send command", "command", s, "err", err)
+		}
 	}
 
 	authed := !requireAuth
@@ -147,10 +159,7 @@ func TestFetchVars_NoAuth(t *testing.T) {
 		"ups.load":        "15",
 	}
 
-	addr := startFakeNUTServer(t, upsName, want, false)
-	host, portStr, _ := net.SplitHostPort(addr)
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
+	host, port, _ := startFakeNUTServer(t, upsName, want, false)
 
 	got, err := FetchVars(host, port, upsName, false, false, "", "")
 	if err != nil {
@@ -171,10 +180,7 @@ func TestFetchVars_WithAuth(t *testing.T) {
 		"ups.status":     "OL CHRG",
 	}
 
-	addr := startFakeNUTServer(t, upsName, want, true)
-	host, portStr, _ := net.SplitHostPort(addr)
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
+	host, port, err := startFakeNUTServer(t, upsName, want, true)
 
 	got, err := FetchVars(host, port, upsName, false, false, "admin", "secret")
 	if err != nil {

@@ -17,11 +17,11 @@ type Collector struct {
 	cfg      config.UPSConfig
 	s        *store.Store
 	writer   *influx.Writer
-	interval time.Duration
+	interval *time.Duration
 }
 
 // New creates a Collector for the given UPS configuration.
-func New(cfg config.UPSConfig, s *store.Store, writer *influx.Writer, interval time.Duration) *Collector {
+func New(cfg config.UPSConfig, s *store.Store, writer *influx.Writer, interval *time.Duration) *Collector {
 	return &Collector{cfg: cfg, s: s, writer: writer, interval: interval}
 }
 
@@ -39,7 +39,7 @@ func (c *Collector) Start() {
 	go func() {
 		// Poll immediately on start, then on each tick.
 		c.poll(log)
-		ticker := time.NewTicker(c.interval)
+		ticker := time.NewTicker(*c.interval)
 		defer ticker.Stop()
 		for range ticker.C {
 			c.poll(log)

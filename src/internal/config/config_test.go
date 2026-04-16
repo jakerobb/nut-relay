@@ -11,8 +11,8 @@ func TestInterpolateEnvVars(t *testing.T) {
 	t.Setenv("NUT_PASS", "secret")
 
 	cfg := &Config{
-		PollInterval: "10s",
-		HTTPPort:     8080,
+		PollIntervalString: "10s",
+		HTTPPort:           8080,
 		InfluxDB: InfluxDB{
 			URL:         "http://influxdb:8086",
 			Token:       "${TEST_TOKEN}",
@@ -42,7 +42,10 @@ func TestInterpolateEnvVars(t *testing.T) {
 }
 
 func TestInterpolateUnsetVar(t *testing.T) {
-	os.Unsetenv("UNSET_VAR")
+	err := os.Unsetenv("UNSET_VAR")
+	if err != nil {
+		t.Errorf("failed to unset env var: %s", err.Error())
+	}
 	result := interpolate("prefix_${UNSET_VAR}_suffix")
 	if result != "prefix__suffix" {
 		t.Errorf("expected 'prefix__suffix', got %q", result)
@@ -77,7 +80,7 @@ upses:
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(tmp)
+	cfg, err := LoadFromPath(tmp)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -110,7 +113,7 @@ upses:
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(tmp)
+	cfg, err := LoadFromPath(tmp)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
