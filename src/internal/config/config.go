@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -31,7 +32,7 @@ type UPSConfig struct {
 	Host          string `yaml:"host"`
 	Port          int    `yaml:"port"`
 	UPSName       string `yaml:"ups_name"`
-	TLS           bool   `yaml:"tls"`
+	TLSMode       string `yaml:"tls_mode"` // plain, tls, starttls
 	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
 	Username      string `yaml:"username"`
 	Password      string `yaml:"password"`
@@ -88,7 +89,20 @@ func LoadFromPath(path string) (*Config, error) {
 }
 
 func truncTokenForLogging(token string) string {
-	return fmt.Sprintf("%s...%s", token[:10], token[len(token)-10:])
+	tokenLength := len(token)
+	if tokenLength == 0 {
+		return "[empty token]"
+	}
+
+	var offset int
+	if tokenLength > 30 {
+		offset = 10
+	} else if tokenLength > 10 {
+		offset = 3
+	} else {
+		return fmt.Sprintf("[redacted - %d chars]", tokenLength)
+	}
+	return fmt.Sprintf("%s...%s", token[:offset], token[tokenLength-offset:])
 }
 
 func validate(cfg *Config) error {
@@ -123,6 +137,22 @@ func validate(cfg *Config) error {
 		if u.UPSName == "" {
 			return fmt.Errorf("upses[%d]: ups_name is required", i)
 		}
+		u.TLSMode = strings.ToLower(u.TLSMode) // case insensitive (Postel's law!)
+		cfg.UPSes[i].TLSMode = u.TLSMode       // copy it back to the slice
+		if u.TLSMode == "" {
+			cfg.UPSes[i].TLSMode = "plain"
+		} else if !validTLSMode(u.TLSMode) {
+			return fmt.Errorf("upses[%d]: invalid tls_mode %q (must be plain, tls, or starttls)", i, u.TLSMode)
+		}
 	}
 	return nil
+}
+
+func validTLSMode(mode string) bool {
+	switch mode {
+	case "plain", "tls", "starttls":
+		return true
+	default:
+		return false
+	}
 }

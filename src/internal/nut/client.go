@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 
@@ -13,24 +14,87 @@ import (
 // VarMap is a map of NUT variable names to their string values.
 type VarMap map[string]string
 
-// FetchVars connects to a NUT server, authenticates if credentials are provided,
-// fetches all variables for the named UPS, and returns them as a VarMap.
-// A new TCP connection is opened and closed for each call.
-func FetchVars(host string, port int, upsName string, useTLS bool, tlsSkipVerify bool, username, password string) (VarMap, error) {
+func connect(host string, port int, tlsMode string, tlsSkipVerify bool) (net.Conn, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 
+	// Connect plain first
 	var conn net.Conn
 	var err error
 
-	if useTLS {
+	conn, err = net.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
+	}
+
+	if tlsMode == "starttls" {
+		// Send STARTTLS and upgrade
+		if _, err := fmt.Fprintf(conn, "STARTTLS\n"); err != nil {
+			return nil, fmt.Errorf("sending STARTTLS: %w", err)
+		}
+		// Read response
+		r := bufio.NewReader(conn)
+		resp, err := r.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("reading STARTTLS response: %w", err)
+		}
+		resp = strings.TrimRight(resp, "\r\n")
+		if !strings.HasPrefix(resp, "OK") {
+			return nil, fmt.Errorf("STARTTLS rejected: %s", resp)
+		}
+		// Upgrade to TLS
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: tlsSkipVerify,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, fmt.Errorf("TLS handshake: %w", err)
+		}
+		conn = tlsConn
+	} else if tlsMode == "tls" {
 		conn, err = tls.Dial("tcp", addr, &tls.Config{
 			InsecureSkipVerify: tlsSkipVerify, //nolint:gosec // intentional per config
 		})
-	} else {
-		conn, err = net.Dial("tcp", addr)
 	}
+
+	return conn, err
+}
+
+func authenticate(send func(cmd string) error, readLine func() (string, error), username string, password string) error {
+	if username != "" {
+		if err := send("USERNAME " + username); err != nil {
+			return fmt.Errorf("sending USERNAME: %w", err)
+		}
+		resp, err := readLine()
+		if err != nil {
+			return fmt.Errorf("reading USERNAME response: %w", err)
+		}
+		if resp != "OK" {
+			return fmt.Errorf("USERNAME rejected: %s", resp)
+		}
+	}
+
+	if password != "" {
+		if err := send("PASSWORD " + password); err != nil {
+			return fmt.Errorf("sending PASSWORD: %w", err)
+		}
+		resp, err := readLine()
+		if err != nil {
+			return fmt.Errorf("reading PASSWORD response: %w", err)
+		}
+		if resp != "OK" {
+			return fmt.Errorf("PASSWORD rejected: %s", resp)
+		}
+	}
+
+	return nil
+}
+
+// FetchVars connects to a NUT server, authenticates if credentials are provided,
+// fetches all variables for the named UPS, and returns them as a VarMap.
+// A new TCP connection is opened and closed for each call.
+func FetchVars(host string, port int, upsName string, tlsMode string, tlsSkipVerify bool, username, password string) (VarMap, error) {
+	conn, err := connect(host, port, tlsMode, tlsSkipVerify)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
+		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 	defer util.CloseCleanly(conn)
 
@@ -49,31 +113,9 @@ func FetchVars(host string, port int, upsName string, useTLS bool, tlsSkipVerify
 		return strings.TrimRight(line, "\r\n"), nil
 	}
 
-	// Authenticate if credentials provided.
-	if username != "" {
-		if err := send("USERNAME " + username); err != nil {
-			return nil, fmt.Errorf("sending USERNAME: %w", err)
-		}
-		resp, err := readLine()
-		if err != nil {
-			return nil, fmt.Errorf("reading USERNAME response: %w", err)
-		}
-		if resp != "OK" {
-			return nil, fmt.Errorf("USERNAME rejected: %s", resp)
-		}
-	}
-
-	if password != "" {
-		if err := send("PASSWORD " + password); err != nil {
-			return nil, fmt.Errorf("sending PASSWORD: %w", err)
-		}
-		resp, err := readLine()
-		if err != nil {
-			return nil, fmt.Errorf("reading PASSWORD response: %w", err)
-		}
-		if resp != "OK" {
-			return nil, fmt.Errorf("PASSWORD rejected: %s", resp)
-		}
+	err = authenticate(send, readLine, username, password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %w", err)
 	}
 
 	// Request variable list.
@@ -106,8 +148,11 @@ func FetchVars(host string, port int, upsName string, useTLS bool, tlsSkipVerify
 		}
 	}
 
-	// Politely disconnect.
-	_ = send("LOGOUT")
+	// Disconnect politely.
+	err = send("LOGOUT")
+	if err != nil {
+		slog.Error("failed to send LOGOUT to NUT server", "err", err)
+	}
 
 	return vars, nil
 }

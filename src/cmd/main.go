@@ -40,7 +40,7 @@ func main() {
 			"host", u.Host,
 			"port", u.Port,
 			"ups_name", u.UPSName,
-			"tls", u.TLS,
+			"tls_mode", u.TLSMode,
 		)
 	}
 

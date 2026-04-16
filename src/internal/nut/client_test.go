@@ -161,7 +161,7 @@ func TestFetchVars_NoAuth(t *testing.T) {
 
 	host, port, _ := startFakeNUTServer(t, upsName, want, false)
 
-	got, err := FetchVars(host, port, upsName, false, false, "", "")
+	got, err := FetchVars(host, port, upsName, "plain", false, "", "")
 	if err != nil {
 		t.Fatalf("FetchVars: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestFetchVars_WithAuth(t *testing.T) {
 
 	host, port, err := startFakeNUTServer(t, upsName, want, true)
 
-	got, err := FetchVars(host, port, upsName, false, false, "admin", "secret")
+	got, err := FetchVars(host, port, upsName, "plain", false, "admin", "secret")
 	if err != nil {
 		t.Fatalf("FetchVars: %v", err)
 	}

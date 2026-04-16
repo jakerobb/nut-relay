@@ -32,7 +32,7 @@ func (c *Collector) Start() {
 		"host", c.cfg.Host,
 		"port", c.cfg.Port,
 		"ups_name", c.cfg.UPSName,
-		"tls", c.cfg.TLS,
+		"tls_mode", c.cfg.TLSMode,
 	)
 	log.Info("starting collector")
 
@@ -50,7 +50,7 @@ func (c *Collector) Start() {
 func (c *Collector) poll(log *slog.Logger) {
 	vars, err := nut.FetchVars(
 		c.cfg.Host, c.cfg.Port, c.cfg.UPSName,
-		c.cfg.TLS, c.cfg.TLSSkipVerify,
+		c.cfg.TLSMode, c.cfg.TLSSkipVerify,
 		c.cfg.Username, c.cfg.Password,
 	)
 	if err != nil {
