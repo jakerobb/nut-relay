@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"time"
@@ -81,7 +82,13 @@ func LoadFromPath(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config from path %s: %w", path, err)
 	}
 
+	slog.Debug("loaded config", "token", truncTokenForLogging(cfg.InfluxDB.Token))
+
 	return &cfg, nil
+}
+
+func truncTokenForLogging(token string) string {
+	return fmt.Sprintf("%s...%s", token[:10], token[len(token)-10:])
 }
 
 func validate(cfg *Config) error {

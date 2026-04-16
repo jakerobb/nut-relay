@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/jakerobb/nut-influx-relay/internal/api"
 	"github.com/jakerobb/nut-influx-relay/internal/collector"
@@ -12,7 +13,13 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	logLevel := slog.LevelInfo
+	if strings.ToLower(os.Getenv("LOG_LEVEL")) == "debug" {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	})))
 
 	cfg, err := config.Load()
 	if err != nil {

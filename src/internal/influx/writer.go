@@ -3,6 +3,8 @@ package influx
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -65,6 +67,7 @@ func (w *Writer) Write(stats *store.UpsStats) error {
 	req.Header.Set("Authorization", "Token "+w.token)
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
+	slog.Debug("sending request to influxdb", "url", w.url, "command", line)
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("posting to influxdb: %w", err)
@@ -72,9 +75,21 @@ func (w *Writer) Write(stats *store.UpsStats) error {
 	defer util.CloseCleanly(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("influxdb returned %d", resp.StatusCode)
+		return fmt.Errorf("influxdb returned %d with body %s", resp.StatusCode, bodyAsString(resp))
 	}
 	return nil
+}
+
+func bodyAsString(resp *http.Response) string {
+	buf := new(strings.Builder)
+	n, err := io.Copy(buf, resp.Body)
+	if err != nil {
+		return fmt.Sprintf("failed to read body: %s", err.Error())
+	}
+	if n == 0 {
+		return "[empty]"
+	}
+	return buf.String()
 }
 
 // BuildLine builds an InfluxDB line protocol string for the given UPS stats.
