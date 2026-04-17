@@ -6,39 +6,14 @@ import (
 )
 
 // UpsStats holds the latest metrics collected from a single UPS.
-// All numeric fields are pointers so that fields not reported by a given UPS
-// serialize as null in JSON and are skipped in InfluxDB writes.
+// Fields contains all configured NUT variable mappings keyed by their InfluxDB field name.
+// Values are float64, int64, or string depending on the field type in the mapping.
 type UpsStats struct {
-	Label       string    `json:"label"`
-	UpsName     string    `json:"ups_name"`
-	CollectedAt time.Time `json:"collected_at"`
-
-	// Battery
-	BatteryCharge  *float64 `json:"battery_charge_percent"`
-	BatteryVoltage *float64 `json:"battery_voltage"`
-	BatteryRuntime *int64   `json:"battery_runtime_seconds"`
-	BatteryLow     *float64 `json:"battery_low"`
-
-	// Input
-	InputVoltage   *float64 `json:"input_voltage"`
-	InputFrequency *float64 `json:"input_frequency"`
-
-	// Output
-	OutputVoltage   *float64 `json:"output_voltage"`
-	OutputCurrent   *float64 `json:"output_current"`
-	OutputPower     *float64 `json:"output_power"`
-	OutputFrequency *float64 `json:"output_frequency"`
-
-	// Power
-	RealPower     *float64 `json:"real_power_watts"`
-	ApparentPower *float64 `json:"apparent_power_va"`
-
-	// UPS
-	Status       string   `json:"status"` // raw NUT ups.status, e.g. "OL CHRG"
-	Load         *float64 `json:"load_percent"`
-	Model        string   `json:"model"`
-	Serial       string   `json:"serial"`
-	Manufacturer string   `json:"manufacturer"`
+	Label       string         `json:"label"`
+	UpsName     string         `json:"ups_name"`
+	CollectedAt time.Time      `json:"collected_at"`
+	Serial      string         `json:"serial"`
+	Fields      map[string]any `json:"fields"`
 }
 
 // Store is an in-memory store for UPS statistics keyed by UPS label.

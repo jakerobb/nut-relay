@@ -55,7 +55,7 @@ func main() {
 	)
 
 	for _, upsCfg := range cfg.UPSes {
-		c := collector.New(upsCfg, s, writer, cfg.PollInterval)
+		c := collector.New(upsCfg, cfg.FieldMappings, s, writer, cfg.PollInterval)
 		c.Start()
 	}
 

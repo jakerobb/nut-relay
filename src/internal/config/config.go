@@ -12,10 +12,12 @@ import (
 )
 
 type Config struct {
-	HTTPPort           int         `yaml:"http_port"`
-	InfluxDB           InfluxDB    `yaml:"influxdb"`
-	UPSes              []UPSConfig `yaml:"upses"`
-	PollIntervalString string      `yaml:"poll_interval"`
+	HTTPPort           int            `yaml:"http_port"`
+	InfluxDB           InfluxDB       `yaml:"influxdb"`
+	UPSes              []UPSConfig    `yaml:"upses"`
+	FieldMappings      []FieldMapping `yaml:"field_mappings"`
+	ExtraFieldMappings []FieldMapping `yaml:"extra_field_mappings"`
+	PollIntervalString string         `yaml:"poll_interval"`
 	PollInterval       *time.Duration
 }
 
@@ -36,6 +38,34 @@ type UPSConfig struct {
 	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
 	Username      string `yaml:"username"`
 	Password      string `yaml:"password"`
+}
+
+// FieldMapping defines how a single NUT variable is mapped to an InfluxDB field.
+type FieldMapping struct {
+	NUTVar      string `yaml:"nut_var"`
+	InfluxField string `yaml:"influx_field"`
+	// Type is one of: float, int, string.
+	Type string `yaml:"type"`
+}
+
+// DefaultFieldMappings is used when field_mappings is omitted from the config.
+var DefaultFieldMappings = []FieldMapping{
+	{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
+	{NUTVar: "battery.runtime", InfluxField: "battery_runtime_seconds", Type: "int"},
+	{NUTVar: "battery.voltage", InfluxField: "battery_voltage", Type: "float"},
+	{NUTVar: "battery.low", InfluxField: "battery_low", Type: "float"},
+	{NUTVar: "input.voltage", InfluxField: "input_voltage", Type: "float"},
+	{NUTVar: "input.frequency", InfluxField: "input_frequency", Type: "float"},
+	{NUTVar: "output.voltage", InfluxField: "output_voltage", Type: "float"},
+	{NUTVar: "output.current", InfluxField: "output_current", Type: "float"},
+	{NUTVar: "output.power", InfluxField: "output_power", Type: "float"},
+	{NUTVar: "output.frequency", InfluxField: "output_frequency", Type: "float"},
+	{NUTVar: "ups.realpower", InfluxField: "real_power_watts", Type: "float"},
+	{NUTVar: "ups.power", InfluxField: "apparent_power_va", Type: "float"},
+	{NUTVar: "ups.status", InfluxField: "ups_status", Type: "string"},
+	{NUTVar: "ups.load", InfluxField: "load_percent", Type: "float"},
+	{NUTVar: "ups.model", InfluxField: "model", Type: "string"},
+	{NUTVar: "ups.mfr", InfluxField: "manufacturer", Type: "string"},
 }
 
 var envVarRe = regexp.MustCompile(`\$\{([^}]+)}`)
@@ -111,7 +141,7 @@ func validate(cfg *Config) error {
 	}
 	pollInterval, err := time.ParseDuration(cfg.PollIntervalString)
 	if err != nil {
-		return fmt.Errorf("invalid poll_interval `%s`: %w", cfg.PollInterval, err)
+		return fmt.Errorf("invalid poll_interval `%s`: %w", cfg.PollIntervalString, err)
 	}
 	cfg.PollInterval = &pollInterval
 
@@ -145,12 +175,60 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("upses[%d]: invalid tls_mode %q (must be plain, tls, or starttls)", i, u.TLSMode)
 		}
 	}
+
+	if len(cfg.FieldMappings) == 0 {
+		cfg.FieldMappings = DefaultFieldMappings
+	} else {
+		validated, err := validateFieldMappings(cfg.FieldMappings, "field_mappings")
+		if err != nil {
+			return err
+		}
+		cfg.FieldMappings = validated
+	}
+
+	if len(cfg.ExtraFieldMappings) > 0 {
+		validated, err := validateFieldMappings(cfg.ExtraFieldMappings, "extra_field_mappings")
+		if err != nil {
+			return err
+		}
+		cfg.FieldMappings = append(cfg.FieldMappings, validated...)
+	}
+
 	return nil
+}
+
+func validateFieldMappings(mappings []FieldMapping, prefix string) ([]FieldMapping, error) {
+	result := make([]FieldMapping, len(mappings))
+	for i, m := range mappings {
+		if m.NUTVar == "" {
+			return nil, fmt.Errorf("%s[%d]: nut_var is required", prefix, i)
+		}
+		if m.InfluxField == "" {
+			return nil, fmt.Errorf("%s[%d]: influx_field is required", prefix, i)
+		}
+		m.Type = strings.ToLower(m.Type) // case insensitive (Postel's law!)
+		if m.Type == "" {
+			m.Type = "string"
+		} else if !validFieldType(m.Type) {
+			return nil, fmt.Errorf("%s[%d]: invalid type %q (must be float, int, or string)", prefix, i, m.Type)
+		}
+		result[i] = m
+	}
+	return result, nil
 }
 
 func validTLSMode(mode string) bool {
 	switch mode {
 	case "plain", "tls", "starttls":
+		return true
+	default:
+		return false
+	}
+}
+
+func validFieldType(t string) bool {
+	switch t {
+	case "float", "int", "string":
 		return true
 	default:
 		return false

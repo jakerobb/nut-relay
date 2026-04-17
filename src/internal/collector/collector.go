@@ -15,14 +15,15 @@ import (
 // Collector polls a single UPS on a fixed interval.
 type Collector struct {
 	cfg      config.UPSConfig
+	mappings []config.FieldMapping
 	s        *store.Store
 	writer   *influx.Writer
 	interval *time.Duration
 }
 
 // New creates a Collector for the given UPS configuration.
-func New(cfg config.UPSConfig, s *store.Store, writer *influx.Writer, interval *time.Duration) *Collector {
-	return &Collector{cfg: cfg, s: s, writer: writer, interval: interval}
+func New(cfg config.UPSConfig, mappings []config.FieldMapping, s *store.Store, writer *influx.Writer, interval *time.Duration) *Collector {
+	return &Collector{cfg: cfg, mappings: mappings, s: s, writer: writer, interval: interval}
 }
 
 // Start launches the polling goroutine. It runs until the process exits.
@@ -58,7 +59,7 @@ func (c *Collector) poll(log *slog.Logger) {
 		return
 	}
 
-	stats := parseVars(vars, c.cfg.Label, c.cfg.UPSName)
+	stats := parseVars(vars, c.cfg.Label, c.cfg.UPSName, c.mappings)
 	c.s.Set(c.cfg.Label, stats)
 
 	if err := c.writer.Write(stats); err != nil {
@@ -66,70 +67,38 @@ func (c *Collector) poll(log *slog.Logger) {
 	}
 }
 
-// parseVars converts a NUT VarMap into a UpsStats struct.
-func parseVars(vars nut.VarMap, label, upsName string) *store.UpsStats {
+// parseVars converts a NUT VarMap into a UpsStats using the configured field mappings.
+// ups.serial is always used to populate Serial (the InfluxDB tag), regardless of mappings.
+func parseVars(vars nut.VarMap, label, upsName string, mappings []config.FieldMapping) *store.UpsStats {
 	s := &store.UpsStats{
 		Label:       label,
 		UpsName:     upsName,
 		CollectedAt: time.Now().UTC(),
+		Serial:      strings.TrimSpace(vars["ups.serial"]),
+		Fields:      make(map[string]any),
 	}
 
-	for k, v := range vars {
-		switch k {
-		case "battery.charge":
-			s.BatteryCharge = parseFloat(v)
-		case "battery.voltage":
-			s.BatteryVoltage = parseFloat(v)
-		case "battery.runtime":
-			s.BatteryRuntime = parseInt(v)
-		case "battery.low":
-			s.BatteryLow = parseFloat(v)
-		case "input.voltage":
-			s.InputVoltage = parseFloat(v)
-		case "input.frequency":
-			s.InputFrequency = parseFloat(v)
-		case "output.voltage":
-			s.OutputVoltage = parseFloat(v)
-		case "output.current":
-			s.OutputCurrent = parseFloat(v)
-		case "output.power":
-			s.OutputPower = parseFloat(v)
-		case "output.frequency":
-			s.OutputFrequency = parseFloat(v)
-		case "ups.realpower":
-			s.RealPower = parseFloat(v)
-		case "ups.power":
-			s.ApparentPower = parseFloat(v)
-		case "ups.status":
-			s.Status = strings.TrimSpace(v)
-		case "ups.load":
-			s.Load = parseFloat(v)
-		case "ups.model":
-			s.Model = v
-		case "ups.serial":
-			s.Serial = v
-		case "ups.mfr":
-			s.Manufacturer = v
+	for _, m := range mappings {
+		rawVal, ok := vars[m.NUTVar]
+		if !ok {
+			continue
+		}
+		rawVal = strings.TrimSpace(rawVal)
+
+		switch m.Type {
+		case "float":
+			if f, err := strconv.ParseFloat(rawVal, 64); err == nil {
+				s.Fields[m.InfluxField] = f
+			}
+		case "int":
+			// Parse as float first to handle values like "3600.0"
+			if f, err := strconv.ParseFloat(rawVal, 64); err == nil {
+				s.Fields[m.InfluxField] = int64(f)
+			}
+		case "string":
+			s.Fields[m.InfluxField] = rawVal
 		}
 	}
 
 	return s
-}
-
-func parseFloat(s string) *float64 {
-	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil {
-		return nil
-	}
-	return &f
-}
-
-func parseInt(s string) *int64 {
-	// NUT battery.runtime is in seconds, may be a float string like "3600.0"
-	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil {
-		return nil
-	}
-	i := int64(f)
-	return &i
 }

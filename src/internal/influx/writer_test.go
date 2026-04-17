@@ -9,49 +9,20 @@ import (
 	"github.com/jakerobb/nut-influx-relay/internal/store"
 )
 
-func TestStatusFlags(t *testing.T) {
-	tests := []struct {
-		status string
-		want   int64
-	}{
-		{"OL", 8},
-		{"OB", 16},
-		{"LB", 32},
-		{"CHRG", 256},
-		{"DISCHRG", 512},
-		{"OL CHRG", 8 | 256},    // 264
-		{"OB LB", 16 | 32},      // 48
-		{"OL DISCHRG", 8 | 512}, // 520
-		{"", 0},
-		{"UNKNOWN", 0},
-		{"OL UNKNOWN CHRG", 8 | 256}, // unknown tokens ignored
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.status, func(t *testing.T) {
-			got := StatusFlags(tc.status)
-			if got != tc.want {
-				t.Errorf("StatusFlags(%q) = %d, want %d", tc.status, got, tc.want)
-			}
-		})
-	}
-}
-
-func ptr[T any](v T) *T { return &v }
-
 func TestBuildLine(t *testing.T) {
 	ts := time.Date(2025, 4, 17, 12, 0, 0, 0, time.UTC)
 
 	stats := &store.UpsStats{
-		Label:          "rack",
-		Serial:         "ABC123",
-		CollectedAt:    ts,
-		Status:         "OL CHRG",
-		BatteryCharge:  ptr(100.0),
-		BatteryRuntime: ptr(int64(3106)),
-		Load:           ptr(10.0),
-		InputVoltage:   ptr(123.3),
-		OutputVoltage:  ptr(123.3),
+		Label:       "rack",
+		Serial:      "ABC123",
+		CollectedAt: ts,
+		Fields: map[string]any{
+			"battery_charge_percent":  float64(100),
+			"battery_runtime_seconds": int64(3106),
+			"load_percent":            float64(10),
+			"input_voltage":           float64(123.3),
+			"ups_status":              "OL CHRG",
+		},
 	}
 
 	line := BuildLine("upsd", stats)
@@ -62,65 +33,50 @@ func TestBuildLine(t *testing.T) {
 
 	// Check measurement and tags
 	if !strings.HasPrefix(line, "upsd,ups_label=rack,serial=ABC123 ") {
-		t.Errorf("unexpected prefix: %s", line)
+		t.Errorf("unexpected prefix: %q", line)
 	}
 
-	// Check status_flags = 8|256 = 264
-	if !strings.Contains(line, "status_flags=264i") {
-		t.Errorf("expected status_flags=264i in: %s", line)
+	// Check float field
+	if !strings.Contains(line, "battery_charge_percent=100") {
+		t.Errorf("expected battery_charge_percent=100 in: %s", line)
 	}
 
-	// Check ups_status field
+	// Check int field (must have 'i' suffix)
+	if !strings.Contains(line, "battery_runtime_seconds=3106i") {
+		t.Errorf("expected battery_runtime_seconds=3106i in: %s", line)
+	}
+
+	// Check string field
 	if !strings.Contains(line, `ups_status="OL CHRG"`) {
 		t.Errorf("expected ups_status field in: %s", line)
 	}
 
-	// Check time_left_ns = 3106 * 1e9
-	expected := "time_left_ns=3106000000000i"
-	if !strings.Contains(line, expected) {
-		t.Errorf("expected %s in: %s", expected, line)
-	}
-
 	// Check timestamp
-	wantTS := ts.UnixNano()
-	if !strings.HasSuffix(line, " "+fmt.Sprintf("%d", wantTS)) {
-		t.Errorf("expected timestamp %d at end of: %s", wantTS, line)
+	if !strings.HasSuffix(line, " "+fmt.Sprintf("%d", ts.UnixNano())) {
+		t.Errorf("expected timestamp %d at end of: %s", ts.UnixNano(), line)
 	}
 }
 
-func TestBuildLine_NilFieldsSkipped(t *testing.T) {
-	ts := time.Now()
+func TestBuildLine_EmptyFields(t *testing.T) {
 	stats := &store.UpsStats{
 		Label:       "office",
 		Serial:      "XYZ",
-		CollectedAt: ts,
-		Status:      "OL",
-		// All numeric fields nil
+		CollectedAt: time.Now(),
+		Fields:      map[string]any{},
 	}
 
 	line := BuildLine("upsd", stats)
-
-	// Should still have ups_status and status_flags
-	if !strings.Contains(line, `ups_status="OL"`) {
-		t.Errorf("expected ups_status field: %s", line)
-	}
-	if !strings.Contains(line, "status_flags=8i") {
-		t.Errorf("expected status_flags=8i: %s", line)
-	}
-
-	// Should NOT contain voltage fields
-	if strings.Contains(line, "battery_charge_percent") {
-		t.Errorf("unexpected battery_charge_percent: %s", line)
+	if line != "" {
+		t.Errorf("expected empty string for empty fields, got: %s", line)
 	}
 }
 
 func TestBuildLine_TagEscaping(t *testing.T) {
-	ts := time.Now()
 	stats := &store.UpsStats{
 		Label:       "my ups",
 		Serial:      "A,B=C",
-		CollectedAt: ts,
-		Status:      "OL",
+		CollectedAt: time.Now(),
+		Fields:      map[string]any{"load_percent": float64(5)},
 	}
 
 	line := BuildLine("upsd", stats)
@@ -130,5 +86,20 @@ func TestBuildLine_TagEscaping(t *testing.T) {
 	}
 	if !strings.Contains(line, `serial=A\,B\=C`) {
 		t.Errorf("expected escaped serial: %s", line)
+	}
+}
+
+func TestBuildLine_StringFieldEscaping(t *testing.T) {
+	stats := &store.UpsStats{
+		Label:       "rack",
+		Serial:      "S1",
+		CollectedAt: time.Now(),
+		Fields:      map[string]any{"ups_status": `OL "QUOTED"`},
+	}
+
+	line := BuildLine("upsd", stats)
+
+	if !strings.Contains(line, `ups_status="OL \"QUOTED\""`) {
+		t.Errorf("expected escaped quotes in string field: %s", line)
 	}
 }

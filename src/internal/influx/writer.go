@@ -13,26 +13,6 @@ import (
 	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
 
-// statusFlagMap maps NUT status tokens to their flag values (matching inputs.upsd convention).
-var statusFlagMap = map[string]int64{
-	"OL":      8,
-	"OB":      16,
-	"LB":      32,
-	"CHRG":    256,
-	"DISCHRG": 512,
-}
-
-// StatusFlags computes the bitwise OR of all recognized status tokens in the NUT status string.
-func StatusFlags(status string) int64 {
-	var flags int64
-	for _, token := range strings.Fields(status) {
-		if f, ok := statusFlagMap[token]; ok {
-			flags |= f
-		}
-	}
-	return flags
-}
-
 // Writer writes UPS stats to InfluxDB using the v2 line protocol over HTTP.
 type Writer struct {
 	url         string // full write endpoint URL
@@ -93,6 +73,7 @@ func bodyAsString(resp *http.Response) string {
 }
 
 // BuildLine builds an InfluxDB line protocol string for the given UPS stats.
+// Field values must be float64, int64, or string — the types produced by the collector.
 // Returns an empty string if there are no fields to write.
 func BuildLine(measurement string, stats *store.UpsStats) string {
 	// Tags: ups_label, serial (escape special chars)
@@ -102,54 +83,16 @@ func BuildLine(measurement string, stats *store.UpsStats) string {
 	)
 
 	var fields []string
-
-	// Numeric fields
-	if stats.BatteryCharge != nil {
-		fields = append(fields, fmt.Sprintf("battery_charge_percent=%g", *stats.BatteryCharge))
+	for name, value := range stats.Fields {
+		switch v := value.(type) {
+		case float64:
+			fields = append(fields, fmt.Sprintf("%s=%g", name, v))
+		case int64:
+			fields = append(fields, fmt.Sprintf("%s=%di", name, v))
+		case string:
+			fields = append(fields, fmt.Sprintf(`%s="%s"`, name, escapeStringField(v)))
+		}
 	}
-	if stats.BatteryRuntime != nil {
-		// Convert seconds to nanoseconds
-		fields = append(fields, fmt.Sprintf("time_left_ns=%di", *stats.BatteryRuntime*int64(time.Second)))
-	}
-	if stats.Load != nil {
-		fields = append(fields, fmt.Sprintf("load_percent=%g", *stats.Load))
-	}
-	if stats.InputVoltage != nil {
-		fields = append(fields, fmt.Sprintf("input_voltage=%g", *stats.InputVoltage))
-	}
-	if stats.OutputVoltage != nil {
-		fields = append(fields, fmt.Sprintf("output_voltage=%g", *stats.OutputVoltage))
-	}
-	if stats.OutputCurrent != nil {
-		fields = append(fields, fmt.Sprintf("output_current=%g", *stats.OutputCurrent))
-	}
-	if stats.OutputPower != nil {
-		fields = append(fields, fmt.Sprintf("output_power=%g", *stats.OutputPower))
-	}
-	if stats.BatteryVoltage != nil {
-		fields = append(fields, fmt.Sprintf("battery_voltage=%g", *stats.BatteryVoltage))
-	}
-	if stats.InputFrequency != nil {
-		fields = append(fields, fmt.Sprintf("input_frequency=%g", *stats.InputFrequency))
-	}
-	if stats.OutputFrequency != nil {
-		fields = append(fields, fmt.Sprintf("output_frequency=%g", *stats.OutputFrequency))
-	}
-	if stats.ApparentPower != nil {
-		fields = append(fields, fmt.Sprintf("apparent_power_va=%g", *stats.ApparentPower))
-	}
-	if stats.RealPower != nil {
-		fields = append(fields, fmt.Sprintf("real_power_watts=%g", *stats.RealPower))
-	}
-
-	// String field: ups_status
-	if stats.Status != "" {
-		fields = append(fields, fmt.Sprintf(`ups_status="%s"`, escapeStringField(stats.Status)))
-	}
-
-	// Integer field: status_flags
-	flags := StatusFlags(stats.Status)
-	fields = append(fields, fmt.Sprintf("status_flags=%di", flags))
 
 	if len(fields) == 0 {
 		return ""
