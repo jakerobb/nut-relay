@@ -2,11 +2,14 @@ package nut
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
@@ -191,5 +194,91 @@ func TestFetchVars_WithAuth(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("var %s: got %q, want %q", k, got[k], v)
 		}
+	}
+}
+
+// startSilentServer accepts connections and reads from them, but never
+// writes anything back: a NUT server that's hung.
+func startSilentServer(t *testing.T) (string, int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { util.CloseCleanly(ln) })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer util.CloseCleanly(conn)
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	return addr.IP.String(), addr.Port
+}
+
+func shortenTimeouts(t *testing.T) {
+	t.Helper()
+	oldDial, oldSession := dialTimeout, sessionTimeout
+	dialTimeout, sessionTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { dialTimeout, sessionTimeout = oldDial, oldSession })
+}
+
+func TestFetchVars_TimesOutOnSilentServer(t *testing.T) {
+	for _, mode := range []string{"plain", "starttls"} {
+		t.Run(mode, func(t *testing.T) {
+			shortenTimeouts(t)
+			host, port := startSilentServer(t)
+
+			start := time.Now()
+			_, err := FetchVars(host, port, "ups", mode, true, "", "")
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatal("FetchVars: expected a timeout error, got nil")
+			}
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				t.Errorf("FetchVars: expected a timeout error, got %v", err)
+			}
+			if elapsed > 2*time.Second {
+				t.Errorf("FetchVars took %v; the session deadline didn't bound it", elapsed)
+			}
+		})
+	}
+}
+
+func TestFetchVars_BareERR(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { util.CloseCleanly(ln) })
+
+	// Mimics the UniFi UPS Tower asked for a UPS name it doesn't have: a
+	// bare "ERR", then it hangs up.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer util.CloseCleanly(conn)
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			return
+		}
+		_, _ = fmt.Fprint(conn, "ERR\n")
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	_, err = FetchVars(addr.IP.String(), addr.Port, "wrong-name", "plain", false, "", "")
+	if err == nil || !strings.Contains(err.Error(), "NUT error: ERR") {
+		t.Errorf("FetchVars: expected a NUT error for a bare ERR, got %v", err)
 	}
 }

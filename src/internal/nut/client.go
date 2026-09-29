@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jakerobb/nut-influx-relay/internal/util"
 )
@@ -14,48 +16,78 @@ import (
 // VarMap is a map of NUT variable names to their string values.
 type VarMap map[string]string
 
+// Bounds on a single poll, so an unresponsive NUT server fails the poll
+// instead of blocking that UPS's collector goroutine forever. dialTimeout
+// covers the TCP connect (and the TLS handshake in "tls" mode);
+// sessionTimeout is one deadline for everything after that: STARTTLS, auth,
+// LIST VAR and LOGOUT. Variables rather than constants so tests can shorten
+// them.
+var (
+	dialTimeout    = 5 * time.Second
+	sessionTimeout = 10 * time.Second
+)
+
 func connect(host string, port int, tlsMode string, tlsSkipVerify bool) (net.Conn, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := &net.Dialer{Timeout: dialTimeout}
 
-	// Connect plain first
-	var conn net.Conn
-	var err error
+	if tlsMode == "tls" {
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			InsecureSkipVerify: tlsSkipVerify, //nolint:gosec // intentional per config
+		})
+		if err != nil {
+			return nil, fmt.Errorf("connecting to %s: %w", addr, err)
+		}
+		if err := conn.SetDeadline(time.Now().Add(sessionTimeout)); err != nil {
+			util.CloseCleanly(conn)
+			return nil, fmt.Errorf("setting deadline: %w", err)
+		}
+		return conn, nil
+	}
 
-	conn, err = net.Dial("tcp", addr)
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
 	}
-
-	if tlsMode == "starttls" {
-		// Send STARTTLS and upgrade
-		if _, err := fmt.Fprintf(conn, "STARTTLS\n"); err != nil {
-			return nil, fmt.Errorf("sending STARTTLS: %w", err)
-		}
-		// Read response
-		r := bufio.NewReader(conn)
-		resp, err := r.ReadString('\n')
-		if err != nil {
-			return nil, fmt.Errorf("reading STARTTLS response: %w", err)
-		}
-		resp = strings.TrimRight(resp, "\r\n")
-		if !strings.HasPrefix(resp, "OK") {
-			return nil, fmt.Errorf("STARTTLS rejected: %s", resp)
-		}
-		// Upgrade to TLS
-		tlsConn := tls.Client(conn, &tls.Config{
-			InsecureSkipVerify: tlsSkipVerify,
-		})
-		if err := tlsConn.Handshake(); err != nil {
-			return nil, fmt.Errorf("TLS handshake: %w", err)
-		}
-		conn = tlsConn
-	} else if tlsMode == "tls" {
-		conn, err = tls.Dial("tcp", addr, &tls.Config{
-			InsecureSkipVerify: tlsSkipVerify, //nolint:gosec // intentional per config
-		})
+	// Set on the raw connection, so it also bounds the STARTTLS exchange and
+	// carries over to the TLS connection wrapped around it below.
+	if err := conn.SetDeadline(time.Now().Add(sessionTimeout)); err != nil {
+		util.CloseCleanly(conn)
+		return nil, fmt.Errorf("setting deadline: %w", err)
 	}
 
-	return conn, err
+	if tlsMode == "starttls" {
+		tlsConn, err := startTLS(conn, tlsSkipVerify)
+		if err != nil {
+			util.CloseCleanly(conn)
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	return conn, nil
+}
+
+func startTLS(conn net.Conn, tlsSkipVerify bool) (net.Conn, error) {
+	if _, err := fmt.Fprintf(conn, "STARTTLS\n"); err != nil {
+		return nil, fmt.Errorf("sending STARTTLS: %w", err)
+	}
+	r := bufio.NewReader(conn)
+	resp, err := r.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("reading STARTTLS response: %w", err)
+	}
+	resp = strings.TrimRight(resp, "\r\n")
+	if !strings.HasPrefix(resp, "OK") {
+		return nil, fmt.Errorf("STARTTLS rejected: %s", resp)
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		InsecureSkipVerify: tlsSkipVerify, //nolint:gosec // intentional per config
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 func authenticate(send func(cmd string) error, readLine func() (string, error), username string, password string) error {
@@ -138,7 +170,9 @@ func FetchVars(host string, port int, upsName string, tlsMode string, tlsSkipVer
 		if line == endMarker {
 			break
 		}
-		if strings.HasPrefix(line, "ERR ") {
+		// A bare "ERR" (no reason) is what the UniFi UPS Tower sends for an
+		// unknown UPS name, before closing the connection.
+		if line == "ERR" || strings.HasPrefix(line, "ERR ") {
 			return nil, fmt.Errorf("NUT error: %s", line)
 		}
 		// VAR <ups-name> <key> "<value>"
