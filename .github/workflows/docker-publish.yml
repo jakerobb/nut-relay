@@ -38,5 +38,3 @@ jobs:
           tags: |
             jakerobb/nut-relay:latest
             jakerobb/nut-relay:${{ steps.date.outputs.tag }}
-            jakerobb/nut-influx-relay:latest
-            jakerobb/nut-influx-relay:${{ steps.date.outputs.tag }}
