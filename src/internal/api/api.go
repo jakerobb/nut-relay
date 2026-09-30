@@ -1,51 +1,79 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
-	"github.com/jakerobb/nut-influx-relay/internal/store"
+	"github.com/jakerobb/nut-relay/internal/metrics"
+	"github.com/jakerobb/nut-relay/internal/store"
 )
 
-// Server exposes HTTP endpoints for UPS status.
+// Server exposes a JSON view of UPS state, plus Prometheus metrics when
+// the output is prometheus.
 type Server struct {
-	s    *store.Store
-	port int
+	s        *store.Store
+	renderer *metrics.Renderer // nil unless the output is prometheus
+	port     int
 }
 
-// New creates a new API Server.
-func New(s *store.Store, port int) *Server {
-	return &Server{s: s, port: port}
+// New creates a new API Server. With a nil renderer, /metrics isn't served.
+func New(s *store.Store, renderer *metrics.Renderer, port int) *Server {
+	return &Server{s: s, renderer: renderer, port: port}
 }
 
-// Start registers routes and begins listening. It blocks until the server fails.
-func (srv *Server) Start() error {
+// Handler returns the server's routes.
+func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if srv.renderer != nil {
+		mux.HandleFunc("/metrics", srv.handleMetrics)
+	}
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/ups", srv.handleUPSList)
 	mux.HandleFunc("/ups/", srv.handleUPSByLabel)
-
-	addr := fmt.Sprintf("0.0.0.0:%d", srv.port)
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
+// Start begins listening. It blocks until the server fails.
+func (srv *Server) Start() error {
+	server := &http.Server{
+		Addr:              fmt.Sprintf("0.0.0.0:%d", srv.port),
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return server.ListenAndServe()
+}
+
+func (srv *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	// Render into a buffer first, so a failure can still be a 500.
+	var buf bytes.Buffer
+	if err := srv.renderer.Write(&buf, srv.s.All(), time.Now()); err != nil {
+		slog.Error("failed to render metrics", "err", err)
+		http.Error(w, "failed to render metrics", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		slog.Error("failed to write metrics response", "err", err)
+	}
+}
+
+// handleHealth reports the process is up. It doesn't depend on any UPS
+// being reachable; nut_up covers that.
 func (srv *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+	_, err := w.Write([]byte(`{"status":"ok"}`))
 	if err != nil {
 		slog.Error("failed to write health response", "err", err)
 	}
 }
 
 func (srv *Server) handleUPSList(w http.ResponseWriter, _ *http.Request) {
-	all := srv.s.All()
-	if all == nil {
-		all = []*store.UpsStats{}
-	}
-	writeJSON(w, http.StatusOK, all)
+	writeJSON(w, http.StatusOK, srv.s.All())
 }
 
 func (srv *Server) handleUPSByLabel(w http.ResponseWriter, r *http.Request) {

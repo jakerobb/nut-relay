@@ -1,149 +1,137 @@
 package collector
 
 import (
+	"errors"
+	"log/slog"
 	"testing"
+	"time"
 
-	"github.com/jakerobb/nut-influx-relay/internal/config"
-	"github.com/jakerobb/nut-influx-relay/internal/nut"
+	"github.com/jakerobb/nut-relay/internal/config"
+	"github.com/jakerobb/nut-relay/internal/nut"
+	"github.com/jakerobb/nut-relay/internal/store"
 )
 
-func TestParseVars_FieldTypes(t *testing.T) {
-	mappings := []config.FieldMapping{
-		{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
-		{NUTVar: "battery.runtime", InfluxField: "battery_runtime_seconds", Type: "int"},
-		{NUTVar: "ups.status", InfluxField: "ups_status", Type: "string"},
-	}
+func newTestCollector(s *store.Store, sink Sink, fetch fetchFunc) *Collector {
+	interval := 10 * time.Second
+	c := New(config.UPSConfig{Label: "rack", Host: "nut-upsd", Port: 3493, UPSName: "cyberpower"}, s, sink, &interval)
+	c.fetch = fetch
+	return c
+}
 
-	vars := nut.VarMap{
-		"battery.charge":  "85.5",
-		"battery.runtime": "3600.0",
-		"ups.status":      "OL CHRG",
-		"ups.serial":      "SN12345",
-	}
+// fakeSink records writes, optionally failing them.
+type fakeSink struct {
+	labels []string
+	vars   []map[string]string
+	err    error
+}
 
-	stats := parseVars(vars, "rack", "cyberpower", mappings)
+func (f *fakeSink) Write(label string, vars map[string]string, _ time.Time) error {
+	f.labels = append(f.labels, label)
+	f.vars = append(f.vars, vars)
+	return f.err
+}
 
-	if stats.Label != "rack" {
-		t.Errorf("label: got %q, want 'rack'", stats.Label)
-	}
-	if stats.Serial != "SN12345" {
-		t.Errorf("serial: got %q, want 'SN12345'", stats.Serial)
-	}
+func TestNewRegistersUPS(t *testing.T) {
+	s := &store.Store{}
+	newTestCollector(s, nil, nil)
 
-	// float
-	f, ok := stats.Fields["battery_charge_percent"].(float64)
-	if !ok || f != 85.5 {
-		t.Errorf("battery_charge_percent: got %v (%T), want float64(85.5)", stats.Fields["battery_charge_percent"], stats.Fields["battery_charge_percent"])
+	st := s.Get("rack")
+	if st == nil {
+		t.Fatal("UPS not registered")
 	}
-
-	// int (parsed from float string)
-	i, ok := stats.Fields["battery_runtime_seconds"].(int64)
-	if !ok || i != 3600 {
-		t.Errorf("battery_runtime_seconds: got %v (%T), want int64(3600)", stats.Fields["battery_runtime_seconds"], stats.Fields["battery_runtime_seconds"])
+	if st.UpsName != "cyberpower" || st.Host != "nut-upsd" {
+		t.Errorf("got %+v", st)
 	}
-
-	// string
-	s, ok := stats.Fields["ups_status"].(string)
-	if !ok || s != "OL CHRG" {
-		t.Errorf("ups_status: got %v (%T), want string('OL CHRG')", stats.Fields["ups_status"], stats.Fields["ups_status"])
+	if st.LastSuccess != nil || st.Polls != 0 {
+		t.Errorf("expected no polls yet, got %+v", st)
 	}
 }
 
-func TestParseVars_MissingNUTVarSkipped(t *testing.T) {
-	mappings := []config.FieldMapping{
-		{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
-		{NUTVar: "input.voltage", InfluxField: "input_voltage", Type: "float"},
+func TestPollSuccess(t *testing.T) {
+	s := &store.Store{}
+	c := newTestCollector(s, nil, func(host string, port int, upsName, tlsMode string, skip bool, user, pass string) (nut.VarMap, error) {
+		if host != "nut-upsd" || port != 3493 || upsName != "cyberpower" {
+			t.Errorf("fetch called with %s:%d %s", host, port, upsName)
+		}
+		return nut.VarMap{"battery.charge": "100"}, nil
+	})
+
+	c.poll(slog.Default())
+
+	st := s.Get("rack")
+	if st.Vars["battery.charge"] != "100" {
+		t.Errorf("vars: got %v", st.Vars)
 	}
-
-	vars := nut.VarMap{
-		"battery.charge": "100",
-		// input.voltage intentionally absent
+	if st.LastSuccess == nil || st.LastAttempt == nil {
+		t.Error("expected LastSuccess and LastAttempt to be set")
 	}
-
-	stats := parseVars(vars, "office", "ups1", mappings)
-
-	if _, ok := stats.Fields["battery_charge_percent"]; !ok {
-		t.Error("expected battery_charge_percent in fields")
-	}
-	if _, ok := stats.Fields["input_voltage"]; ok {
-		t.Error("input_voltage should not be present when NUT var is absent")
-	}
-}
-
-func TestParseVars_UnmappedNUTVarsIgnored(t *testing.T) {
-	mappings := []config.FieldMapping{
-		{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
-	}
-
-	vars := nut.VarMap{
-		"battery.charge":   "90",
-		"battery.voltage":  "13.2", // not in mappings
-		"ups.manufacturer": "APC",  // not in mappings
-	}
-
-	stats := parseVars(vars, "rack", "ups1", mappings)
-
-	if len(stats.Fields) != 1 {
-		t.Errorf("expected 1 field, got %d: %v", len(stats.Fields), stats.Fields)
+	if st.Polls != 1 || st.Failures != 0 || st.LastError != "" {
+		t.Errorf("got polls=%d failures=%d err=%q", st.Polls, st.Failures, st.LastError)
 	}
 }
 
-func TestParseVars_SerialAlwaysPopulated(t *testing.T) {
-	mappings := []config.FieldMapping{
-		{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
-		// ups.serial intentionally not in mappings
+func TestPollFailureKeepsLastGoodVars(t *testing.T) {
+	s := &store.Store{}
+	fail := false
+	c := newTestCollector(s, nil, func(string, int, string, string, bool, string, string) (nut.VarMap, error) {
+		if fail {
+			return nil, errors.New("connection refused")
+		}
+		return nut.VarMap{"battery.charge": "100"}, nil
+	})
+
+	c.poll(slog.Default())
+	fail = true
+	c.poll(slog.Default())
+
+	st := s.Get("rack")
+	if st.Vars["battery.charge"] != "100" {
+		t.Errorf("last good vars lost: %v", st.Vars)
 	}
-
-	vars := nut.VarMap{
-		"battery.charge": "95",
-		"ups.serial":     "XYZ789",
+	if st.LastError != "connection refused" {
+		t.Errorf("LastError: got %q", st.LastError)
 	}
-
-	stats := parseVars(vars, "rack", "ups1", mappings)
-
-	if stats.Serial != "XYZ789" {
-		t.Errorf("serial: got %q, want 'XYZ789'", stats.Serial)
+	if st.Polls != 2 || st.Failures != 1 {
+		t.Errorf("got polls=%d failures=%d, want 2 and 1", st.Polls, st.Failures)
 	}
-	// Serial should not appear in Fields (it's a tag, not a field)
-	if _, ok := stats.Fields["serial"]; ok {
-		t.Error("serial should not appear in Fields")
-	}
-}
-
-func TestParseVars_InvalidFloatSkipped(t *testing.T) {
-	mappings := []config.FieldMapping{
-		{NUTVar: "battery.charge", InfluxField: "battery_charge_percent", Type: "float"},
-	}
-
-	vars := nut.VarMap{
-		"battery.charge": "not-a-number",
-	}
-
-	stats := parseVars(vars, "rack", "ups1", mappings)
-
-	if _, ok := stats.Fields["battery_charge_percent"]; ok {
-		t.Error("invalid float value should not appear in Fields")
+	if !st.LastAttempt.After(*st.LastSuccess) && !st.LastAttempt.Equal(*st.LastSuccess) {
+		t.Errorf("LastAttempt %v before LastSuccess %v", st.LastAttempt, st.LastSuccess)
 	}
 }
 
-func TestParseVars_DefaultMappings(t *testing.T) {
-	vars := nut.VarMap{
-		"battery.charge":  "100",
-		"battery.runtime": "3600",
-		"ups.status":      "OL",
-		"ups.serial":      "SN001",
-		"ups.load":        "12.5",
-	}
+func TestPollWritesToSink(t *testing.T) {
+	s := &store.Store{}
+	sink := &fakeSink{}
+	fail := false
+	c := newTestCollector(s, sink, func(string, int, string, string, bool, string, string) (nut.VarMap, error) {
+		if fail {
+			return nil, errors.New("connection refused")
+		}
+		return nut.VarMap{"battery.charge": "100"}, nil
+	})
 
-	stats := parseVars(vars, "rack", "cyberpower", config.DefaultFieldMappings)
+	c.poll(slog.Default())
+	fail = true
+	c.poll(slog.Default())
 
-	if _, ok := stats.Fields["battery_charge_percent"]; !ok {
-		t.Error("expected battery_charge_percent")
+	// Only the successful poll reaches the sink.
+	if len(sink.labels) != 1 || sink.labels[0] != "rack" || sink.vars[0]["battery.charge"] != "100" {
+		t.Errorf("sink got labels=%v vars=%v", sink.labels, sink.vars)
 	}
-	if _, ok := stats.Fields["battery_runtime_seconds"]; !ok {
-		t.Error("expected battery_runtime_seconds")
-	}
-	if _, ok := stats.Fields["ups_status"]; !ok {
-		t.Error("expected ups_status")
+}
+
+func TestSinkFailureDoesNotFailPoll(t *testing.T) {
+	s := &store.Store{}
+	sink := &fakeSink{err: errors.New("influxdb returned 401")}
+	c := newTestCollector(s, sink, func(string, int, string, string, bool, string, string) (nut.VarMap, error) {
+		return nut.VarMap{"battery.charge": "100"}, nil
+	})
+
+	c.poll(slog.Default())
+
+	// The poll itself succeeded; a failed write is logged, not recorded as a poll failure.
+	st := s.Get("rack")
+	if st.Failures != 0 || st.LastError != "" || st.Vars["battery.charge"] != "100" {
+		t.Errorf("got %+v", st)
 	}
 }

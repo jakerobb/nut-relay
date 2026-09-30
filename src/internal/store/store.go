@@ -1,47 +1,97 @@
 package store
 
 import (
+	"maps"
+	"slices"
 	"sync"
 	"time"
 )
 
-// UpsStats holds the latest metrics collected from a single UPS.
-// Fields contains all configured NUT variable mappings keyed by their InfluxDB field name.
-// Values are float64, int64, or string depending on the field type in the mapping.
-type UpsStats struct {
-	Label       string         `json:"label"`
-	UpsName     string         `json:"ups_name"`
-	CollectedAt time.Time      `json:"collected_at"`
-	Serial      string         `json:"serial"`
-	Fields      map[string]any `json:"fields"`
+// UpsState is what's known about one UPS: its latest successful poll and
+// how polling is going.
+type UpsState struct {
+	Label   string `json:"label"`
+	UpsName string `json:"ups_name"`
+	Host    string `json:"host"`
+	// Vars holds every NUT variable from the last successful poll, as strings,
+	// exactly as the NUT server sent them. Nil until a poll has succeeded.
+	Vars        map[string]string `json:"vars"`
+	LastSuccess *time.Time        `json:"last_success"`
+	LastAttempt *time.Time        `json:"last_attempt"`
+	// LastError is the error from the latest poll, or empty if it succeeded.
+	LastError string `json:"last_error,omitempty"`
+	Polls     uint64 `json:"polls"`
+	Failures  uint64 `json:"failures"`
 }
 
-// Store is an in-memory store for UPS statistics keyed by UPS label.
-// Each UPS label has exactly one writer goroutine, so sync.Map is appropriate.
+// Store holds the state of every configured UPS, keyed by label.
 type Store struct {
-	m sync.Map
+	mu sync.RWMutex
+	m  map[string]*UpsState
 }
 
-// Set stores the stats for the given UPS label.
-func (s *Store) Set(label string, stats *UpsStats) {
-	s.m.Store(label, stats)
+// Register adds a UPS before its first poll, so it's reported (as down)
+// even if no poll ever succeeds.
+func (s *Store) Register(label, upsName, host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = make(map[string]*UpsState)
+	}
+	s.m[label] = &UpsState{Label: label, UpsName: upsName, Host: host}
 }
 
-// Get returns the stats for the given UPS label, or nil if not found.
-func (s *Store) Get(label string) *UpsStats {
-	v, ok := s.m.Load(label)
+// RecordSuccess stores the variables from a successful poll.
+func (s *Store) RecordSuccess(label string, vars map[string]string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[label]
+	if !ok {
+		return
+	}
+	st.Vars = vars
+	st.LastSuccess = &at
+	st.LastAttempt = &at
+	st.LastError = ""
+	st.Polls++
+}
+
+// RecordFailure notes a failed poll. The last good variables are kept for
+// the JSON API; the metrics endpoint decides whether they're still fresh.
+func (s *Store) RecordFailure(label string, err error, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[label]
+	if !ok {
+		return
+	}
+	st.LastAttempt = &at
+	st.LastError = err.Error()
+	st.Polls++
+	st.Failures++
+}
+
+// Get returns a copy of the given UPS's state, or nil if it isn't registered.
+func (s *Store) Get(label string) *UpsState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.m[label]
 	if !ok {
 		return nil
 	}
-	return v.(*UpsStats)
+	c := *st
+	return &c
 }
 
-// All returns a slice of all currently stored UPS stats.
-func (s *Store) All() []*UpsStats {
-	var result []*UpsStats
-	s.m.Range(func(_, v any) bool {
-		result = append(result, v.(*UpsStats))
-		return true
-	})
+// All returns copies of every UPS's state, sorted by label. Vars maps are
+// replaced wholesale on each poll, never modified, so sharing them is safe.
+func (s *Store) All() []*UpsState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*UpsState, 0, len(s.m))
+	for _, label := range slices.Sorted(maps.Keys(s.m)) {
+		c := *s.m[label]
+		result = append(result, &c)
+	}
 	return result
 }

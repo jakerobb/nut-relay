@@ -1,4 +1,4 @@
-module github.com/jakerobb/nut-influx-relay
+module github.com/jakerobb/nut-relay
 
 go 1.27
 

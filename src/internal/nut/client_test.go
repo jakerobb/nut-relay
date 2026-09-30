@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jakerobb/nut-influx-relay/internal/util"
+	"github.com/jakerobb/nut-relay/internal/util"
 )
 
 func TestParseVarLine(t *testing.T) {
