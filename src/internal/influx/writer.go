@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jakerobb/nut-influx-relay/internal/store"
-	"github.com/jakerobb/nut-influx-relay/internal/util"
+	"github.com/jakerobb/nut-relay/internal/config"
+	"github.com/jakerobb/nut-relay/internal/util"
 )
 
 // Writer writes UPS stats to InfluxDB using the v2 line protocol over HTTP.
@@ -18,24 +18,27 @@ type Writer struct {
 	url         string // full write endpoint URL
 	token       string
 	measurement string
+	mappings    []config.FieldMapping
 	client      *http.Client
 }
 
 // New creates a new Writer.
-func New(baseURL, token, org, bucket, measurement string) *Writer {
+func New(baseURL, token, org, bucket, measurement string, mappings []config.FieldMapping) *Writer {
 	url := fmt.Sprintf("%s/api/v2/write?org=%s&bucket=%s&precision=ns",
 		strings.TrimRight(baseURL, "/"), org, bucket)
 	return &Writer{
 		url:         url,
 		token:       token,
 		measurement: measurement,
+		mappings:    mappings,
 		client:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-// Write serializes stats to InfluxDB line protocol and POSTs it to InfluxDB.
-func (w *Writer) Write(stats *store.UpsStats) error {
-	line := BuildLine(w.measurement, stats)
+// Write maps one poll's NUT variables to fields, serializes them to InfluxDB
+// line protocol, and POSTs them to InfluxDB. It implements collector.Sink.
+func (w *Writer) Write(label string, vars map[string]string, at time.Time) error {
+	line := BuildLine(w.measurement, BuildPoint(vars, label, w.mappings, at))
 	if line == "" {
 		return nil
 	}
@@ -72,10 +75,10 @@ func bodyAsString(resp *http.Response) string {
 	return buf.String()
 }
 
-// BuildLine builds an InfluxDB line protocol string for the given UPS stats.
-// Field values must be float64, int64, or string — the types produced by the collector.
+// BuildLine builds an InfluxDB line protocol string for the given point.
+// Field values must be float64, int64, or string — the types BuildPoint produces.
 // Returns an empty string if there are no fields to write.
-func BuildLine(measurement string, stats *store.UpsStats) string {
+func BuildLine(measurement string, stats *Point) string {
 	// Tags: ups_label, serial (escape special chars)
 	tags := fmt.Sprintf(",ups_label=%s,serial=%s",
 		escapeTag(stats.Label),

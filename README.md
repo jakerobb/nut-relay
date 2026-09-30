@@ -1,128 +1,216 @@
-# nut-influx-relay
+# nut-relay
 
-A Go service that polls one or more NUT (Network UPS Tools) servers, writes UPS metrics
-to InfluxDB, keeps the latest stats for each UPS in memory, and exposes a simple HTTP API.
+A Go service that polls one or more NUT (Network UPS Tools) servers, keeps the latest
+variables for each UPS in memory, and relays them to one of two outputs:
+
+- **InfluxDB:** writes each poll to InfluxDB v2 with the line protocol (the default)
+- **Prometheus:** serves them as metrics on `/metrics`
+
+It also serves a small JSON API with every UPS's latest variables.
+
+Formerly `nut-influx-relay`, which only wrote to InfluxDB. Existing configs keep working
+unchanged; see [Upgrading from nut-influx-relay](#upgrading-from-nut-influx-relay).
 
 ---
 
 ## Purpose
 
-- Replace `inputs.upsd` in a Telegraf/InfluxDB/Grafana homelab stack
-- Support NUT servers that require TLS (e.g. UniFi UPS Tower), which Telegraf's native
-  `inputs.upsd` plugin cannot handle
-- Support reading from multiple NUT servers
-- Expose a lightweight HTTP API and web UI for UPS status, replacing `edgd1er/webnut`
-- Run as a long-lived Docker service
+- Replace `inputs.upsd` in a Telegraf/InfluxDB/Grafana stack, or export to Prometheus
+- Support NUT servers that need TLS or STARTTLS (Telegraf's `inputs.upsd` can't), and
+  ones that need a login
+- Work with NUT servers that implement only part of the protocol. The UniFi UPS Tower
+  answers `LIST VAR` but returns `ERR INVALID-ARGUMENT` for `LIST CLIENT`,
+  `GET NUMLOGINS` and `LIST RW`, which breaks clients built on the `go.nut` library
+  (such as `DRuggeri/nut_exporter`). This one only ever sends `LIST VAR`.
+- Read from several NUT servers from one process
+- Run as a long-lived container
 
 ---
 
 ## Repository Layout
 
 ```
-nut-influx-relay/
-├── CLAUDE.md
+nut-relay/
 ├── Dockerfile
 ├── .dockerignore
 ├── .gitignore
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml
-├── src/
-│   ├── go.mod
-│   ├── go.sum
-│   └── cmd/
-│       └── main.go          # entry point
-│   └── internal/
-│       ├── config/
-│       │   └── config.go    # config file parsing + validation
-│       ├── nut/
-│       │   └── client.go    # NUT wire protocol client (plain + TLS)
-│       ├── store/
-│       │   └── store.go     # in-memory stats store
-│       ├── collector/
-│       │   └── collector.go # per-UPS poll goroutines
-│       ├── influx/
-│       │   └── writer.go    # InfluxDB v2 line protocol writer
-│       └── api/
-│           └── api.go       # HTTP handlers
+└── src/
+    ├── go.mod
+    ├── go.sum
+    ├── cmd/
+    │   └── main.go            # entry point; picks the output
+    └── internal/
+        ├── config/
+        │   └── config.go      # config file parsing + validation
+        ├── nut/
+        │   └── client.go      # NUT wire protocol client (plain, TLS, STARTTLS)
+        ├── store/
+        │   └── store.go       # in-memory state per UPS
+        ├── collector/
+        │   └── collector.go   # per-UPS poll goroutines
+        ├── influx/
+        │   ├── mapping.go     # NUT variables → InfluxDB fields
+        │   └── writer.go      # InfluxDB v2 line protocol writer
+        ├── metrics/
+        │   └── metrics.go     # Prometheus text format
+        └── api/
+            └── api.go         # HTTP handlers
 ```
 
 ---
 
 ## Configuration
 
-Mounted at `/etc/nut-influx-relay/config.yaml`. Path overridable via `CONFIG_PATH` env var.
+Read from `CONFIG_PATH` if set, else `/etc/nut-relay/config.yaml`, else
+`/etc/nut-influx-relay/config.yaml` (the old location). Set `LOG_LEVEL=debug` for a log
+line per poll.
 
-`url`, `token`, `username`, and `password` may be specified as literal strings or as env var references using `${VAR_NAME}` syntax.
+`url`, `token`, `username`, and `password` may be literal strings or env var references
+using `${VAR_NAME}` syntax.
 
-### Example config.yaml
+`output` picks **one** output per process: `influxdb` (the default) or `prometheus`. To
+feed both, run two instances. Settings for the other output are rejected rather than
+ignored, so a config that mixes them fails at startup.
+
+### Settings for both outputs
 
 ```yaml
-poll_interval: 10s
-http_port: 8080
-
-influxdb:
-  url: http://influxdb:8086
-  token: ${INFLUXDB_TOKEN}
-  org: home
-  bucket: telegraf
-  measurement: upsd      # must match what Telegraf's inputs.upsd would write
+output: influxdb        # influxdb (default) or prometheus
+poll_interval: 10s      # required
+http_port: 8080         # default 8080
 
 upses:
-  - label: rack
-    host: nut-upsd
-    port: 3493
-    ups_name: cyberpower
-    tls_mode: plain        # plain (default), tls, or starttls
+  - label: rack          # required, unique. The InfluxDB ups_label tag, or the
+                         # Prometheus ups label
+    host: nut-upsd       # required
+    port: 3493           # default 3493
+    ups_name: cyberpower # required: the UPS's name on that NUT server
+    tls_mode: plain      # plain (default), tls, or starttls
     username: ${NUT_USER}
     password: ${NUT_PASSWORD}
 
   - label: office
     host: 192.168.0.9
-    port: 3493
     ups_name: office-ups
-    tls_mode: starttls     # the UniFi UPS Tower speaks STARTTLS, not implicit TLS
+    tls_mode: starttls     # the UniFi UPS Tower offers STARTTLS; plain reads work too
     tls_skip_verify: true  # its certificate is self-signed
-    # no username/password -- UniFi Tower allows unauthenticated reads
+    # no username/password -- the Tower allows unauthenticated reads
+```
+
+### InfluxDB output
+
+```yaml
+influxdb:
+  url: http://influxdb:8086   # required
+  token: ${INFLUXDB_TOKEN}
+  org: home
+  bucket: telegraf
+  measurement: upsd           # default upsd, matching Telegraf's inputs.upsd
+
+# Optional. Replaces the default mappings below.
+# field_mappings:
+#   - {nut_var: battery.charge, influx_field: battery_charge_percent, type: float}
+
+# Optional. Added to the default (or explicit) mappings.
+extra_field_mappings:
+  - nut_var: ups.realpower
+    influx_field: real_power_watts
+    type: float            # float, int or string (default string)
+```
+
+### Prometheus output
+
+```yaml
+output: prometheus
+
+# Optional. If set, exactly these NUT variables are exported (ups.status included).
+# If not, every numeric variable is, except driver.*, ups.productid and ups.vendorid.
+# variables: [battery.charge, battery.runtime, ups.load, ups.realpower, ups.status]
 ```
 
 ---
 
-### NUT variable → struct field mapping
+## InfluxDB output
 
-| NUT variable        | Struct field         |
-|---------------------|----------------------|
-| battery.charge      | BatteryCharge        |
-| battery.voltage     | BatteryVoltage       |
-| battery.runtime     | BatteryRuntime       |
-| battery.low         | BatteryLow           |
-| input.voltage       | InputVoltage         |
-| input.frequency     | InputFrequency       |
-| output.voltage      | OutputVoltage        |
-| output.current      | OutputCurrent        |
-| output.power        | OutputPower          |
-| output.frequency    | OutputFrequency      |
-| ups.status          | Status               |
-| ups.load            | Load                 |
-| ups.model           | Model                |
-| ups.serial          | Serial               |
-| ups.mfr             | Manufacturer         |
+On each successful poll, the configured field mappings turn NUT variables into fields,
+and one line is POSTed to InfluxDB with the v2 line protocol over HTTP (no SDK).
 
-Any NUT variables not in this mapping are silently ignored.
+Endpoint: `POST /api/v2/write?org=<org>&bucket=<bucket>&precision=ns`
+
+Headers:
+- `Authorization: Token <token>`
+- `Content-Type: text/plain; charset=utf-8`
+
+```
+upsd,ups_label=rack,serial=XXXX battery_charge_percent=100,battery_runtime_seconds=3106i,load_percent=10,input_voltage=123.3,ups_status="OL" 1744900000000000000
+```
+
+Tags: `ups_label` (the configured label) and `serial` (always `ups.serial`, whatever the
+mappings). Fields: every mapped NUT variable the UPS reports that parses as its type.
+Variables the UPS doesn't report are left out. A failed poll writes nothing, and a failed
+write is logged and doesn't affect the poll.
+
+### Default field mappings
+
+| NUT variable       | InfluxDB field            | Type   |
+|--------------------|---------------------------|--------|
+| battery.charge     | battery_charge_percent    | float  |
+| battery.runtime    | battery_runtime_seconds   | int    |
+| battery.voltage    | battery_voltage           | float  |
+| battery.low        | battery_low               | float  |
+| input.voltage      | input_voltage             | float  |
+| input.frequency    | input_frequency           | float  |
+| output.voltage     | output_voltage            | float  |
+| output.current     | output_current            | float  |
+| output.power       | output_power              | float  |
+| output.frequency   | output_frequency          | float  |
+| ups.realpower      | real_power_watts          | float  |
+| ups.power          | apparent_power_va         | float  |
+| ups.status         | ups_status                | string |
+| ups.load           | load_percent              | float  |
+| ups.model          | model                     | string |
+| ups.mfr            | manufacturer              | string |
 
 ---
 
-## In-Memory Store
+## Prometheus output
 
-On each successful poll:
-1. Build a new `UpsStats`
-2. Call `store.Store(label, stats)`
-3. Write to InfluxDB
+`GET /metrics`, in the Prometheus text format. Every metric has a `ups` label, the
+UPS's configured `label`.
 
-On failed poll: 
-* log the error
-* do NOT update the store (preserve last known state),
-* do NOT write to InfluxDB.
+| Metric | Type | Meaning |
+|---|---|---|
+| `nut_<variable>` | gauge | Each numeric NUT variable, with dots (and anything else not allowed in a metric name) as underscores: `battery.charge` → `nut_battery_charge` |
+| `nut_ups_status{flag}` | gauge | `ups.status` split into flags: 1 for each flag present. The common flags (OL, OB, LB, HB, RB, CHRG, DISCHRG, BYPASS, CAL, OFF, OVER, TRIM, BOOST, FSD) are always exported, as 0 when absent, so alerts on them always have a series |
+| `nut_ups_info{ups_name,mfr,model,serial}` | gauge | Always 1. Identity from `device.*`, falling back to `ups.*` |
+| `nut_up` | gauge | 1 if the latest poll succeeded, else 0 |
+| `nut_last_success_timestamp_seconds` | gauge | Unix time of the latest successful poll |
+| `nut_polls_total` | counter | Polls attempted |
+| `nut_poll_failures_total` | counter | Polls that failed |
+
+Non-numeric variables (other than `ups.status`) aren't exported as metrics; the JSON
+API has them.
+
+**Stale data:** after a failed poll, the last good values are still exported for up to
+three poll intervals, so one blip doesn't leave a gap. After that the NUT variables,
+`nut_ups_status` and `nut_ups_info` are left out until a poll succeeds again, so a dead
+UPS shows as missing data rather than a flat line. `nut_up` and the counters are always
+exported.
+
+Scraping never touches the NUT servers: it reads what the collectors last stored.
+
+---
+
+## Collector
+
+One goroutine per UPS, started at service startup. Each goroutine:
+- Polls immediately, then on every `poll_interval`
+- Connects to its NUT server, fetches all variables, closes the connection
+- On success: replaces that UPS's stored variables, and (InfluxDB output) writes them
+- On failure: logs the error and records it, keeping the last good variables
 
 ---
 
@@ -142,8 +230,7 @@ Server: END LIST VAR <upsname>
 Client: LOGOUT\n
 ```
 
-The UniFi UPS Tower offers TLS via STARTTLS and, by default, doesn't require authentication. Other NUT servers may require authentication but 
-not TLS. This app is written to support all four combinations of TLS/plain and authenticated/unauthenticated.
+Supports all four combinations of TLS/plain and authenticated/unauthenticated.
 
 Per-connection flow:
 1. Dial TCP (plain, TLS, or plain then STARTTLS, per config). The connect (plus the TLS handshake in `tls` mode) times
@@ -151,91 +238,55 @@ Per-connection flow:
    the UPS's collector.
 2. Authenticate if username+password configured
 3. Send `LIST VAR <upsname>`
-4. Read and parse response lines until `END LIST VAR`
+4. Read and parse response lines until `END LIST VAR` (an `ERR` line fails the poll)
 5. Send `LOGOUT`
 6. Close connection
 
-Open a new connection on every poll — do not maintain persistent connections.
-
----
-
-## Collector
-
-One goroutine per UPS, started at service startup. Each goroutine:
-- Ticks on `poll_interval`
-- Connects to its NUT server, fetches stats, closes connection
-- On success: updates store, writes to InfluxDB
-- On failure: logs error with UPS label, continues (does not crash)
-
----
-
-## InfluxDB Writer
-
-Write using the InfluxDB v2 line protocol over HTTP (no SDK — keep dependencies minimal).
-
-Endpoint: `POST /api/v2/write?org=<org>&bucket=<bucket>&precision=ns`
-
-Headers:
-- `Authorization: Token <token>`
-- `Content-Type: text/plain; charset=utf-8`
-
-Line protocol format — match `inputs.upsd` field names exactly so existing Grafana
-dashboards work without changes:
-
-```
-upsd,ups_label=rack,serial=XXXX battery_charge_percent=100,time_left_ns=3106000000000i,load_percent=10,input_voltage=123.3,output_voltage=123.3,ups_status="OL",status_flags=1i 1744900000000000000
-```
-
-Tag keys: `ups_label`, `serial`
-Field keys: all numeric UpsStats fields that are non-nil, plus `ups_status` (string field)
-  and `status_flags` (integer, derived from Status string).
-
-### status_flags mapping (matching inputs.upsd convention)
-
-| ups.status contains | status_flags |
-|---------------------|--------------|
-| OL                  | 8            |
-| OB                  | 16           |
-| LB                  | 32           |
-| CHRG                | 256          |
-| DISCHRG             | 512          |
-
-Flags are bitwise OR'd for compound states (e.g. `OL CHRG` → 8|256 = 264).
-
-### Field name mapping for InfluxDB line protocol
-
-| UpsStats field  | Line protocol field name |
-|-----------------|--------------------------|
-| BatteryCharge   | battery_charge_percent   |
-| BatteryRuntime  | time_left_ns (×1e9, int) |
-| Load            | load_percent             |
-| InputVoltage    | input_voltage            |
-| OutputVoltage   | output_voltage           |
-| OutputCurrent   | output_current           |
-| OutputPower     | output_power             |
-| BatteryVoltage  | battery_voltage          |
-| InputFrequency  | input_frequency          |
-| OutputFrequency | output_frequency         |
-
-Null values are omitted when writing to InfluxDB
+A new connection is opened on every poll; no persistent connections.
 
 ---
 
 ## HTTP API
 
-Bind to `0.0.0.0:<http_port>`.
+Binds to `0.0.0.0:<http_port>`.
+
+### GET /metrics
+Prometheus metrics, above. Only with `output: prometheus`; 404 otherwise.
 
 ### GET /health
-Returns 200 OK with `{"status":"ok"}`. Always responds even if no UPS data yet.
+Returns 200 OK with `{"status":"ok"}`, whether or not any UPS is reachable.
 
 ### GET /ups
-Returns JSON array of all `*UpsStats` currently in the store. If a UPS has not yet been
-successfully polled, it is omitted (not returned as null). Returns `[]` if store is empty.
+JSON array of every configured UPS's state, sorted by label: all its NUT variables as
+strings (`vars`, null until a poll succeeds), `last_success`, `last_attempt`,
+`last_error`, and poll counts.
 
 ### GET /ups/{label}
-Returns a single `*UpsStats` as a JSON object. Returns 404 with
-`{"error":"not found"}` if label unknown or not yet polled.
+One UPS's state as a JSON object. 404 with `{"error":"not found"}` for an unknown label.
+
+---
+
+## Upgrading from nut-influx-relay
+
+- **Config:** unchanged. With no `output`, it's `influxdb`, and the lines written are the
+  same. The file is still found at `/etc/nut-influx-relay/config.yaml`.
+- **Image:** published as both `jakerobb/nut-relay` and `jakerobb/nut-influx-relay`.
+- **JSON API:** `/ups` and `/ups/{label}` changed shape. They now return every raw NUT
+  variable (`vars`) plus poll status, instead of the mapped InfluxDB fields, and list a
+  UPS before its first successful poll too.
+- **Config validation** is a little stricter: at least one UPS, unique labels, a positive
+  `poll_interval`.
+
+---
+
+## Image
+
+Published to Docker Hub as `jakerobb/nut-relay` (and `jakerobb/nut-influx-relay`) on
+every push to `main`, tagged `latest` and `YYYYMMDD`, for `linux/amd64` and
+`linux/arm64`. Built from `scratch`, running as UID 65532. The build runs `go vet` and
+the tests, so a failure blocks the publish.
 
 ## Side goals
-- Avoid unnecessary dependencies like NUT client libraries and InfluxDB SDKs.
+- No unnecessary dependencies: no NUT client library, no InfluxDB SDK, no Prometheus
+  client library.
 - Emphasis on testability and maintainability

@@ -2,28 +2,36 @@ package collector
 
 import (
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/jakerobb/nut-influx-relay/internal/config"
-	"github.com/jakerobb/nut-influx-relay/internal/influx"
-	"github.com/jakerobb/nut-influx-relay/internal/nut"
-	"github.com/jakerobb/nut-influx-relay/internal/store"
+	"github.com/jakerobb/nut-relay/internal/config"
+	"github.com/jakerobb/nut-relay/internal/nut"
+	"github.com/jakerobb/nut-relay/internal/store"
 )
+
+// fetchFunc matches nut.FetchVars; tests substitute a fake.
+type fetchFunc func(host string, port int, upsName string, tlsMode string, tlsSkipVerify bool, username, password string) (nut.VarMap, error)
+
+// Sink receives every successful poll, for outputs that push (InfluxDB).
+// Pull outputs (Prometheus) read the store instead and need no sink.
+type Sink interface {
+	Write(label string, vars map[string]string, at time.Time) error
+}
 
 // Collector polls a single UPS on a fixed interval.
 type Collector struct {
 	cfg      config.UPSConfig
-	mappings []config.FieldMapping
 	s        *store.Store
-	writer   *influx.Writer
+	sink     Sink
 	interval *time.Duration
+	fetch    fetchFunc
 }
 
-// New creates a Collector for the given UPS configuration.
-func New(cfg config.UPSConfig, mappings []config.FieldMapping, s *store.Store, writer *influx.Writer, interval *time.Duration) *Collector {
-	return &Collector{cfg: cfg, mappings: mappings, s: s, writer: writer, interval: interval}
+// New creates a Collector for the given UPS configuration and registers the
+// UPS in the store. sink may be nil.
+func New(cfg config.UPSConfig, s *store.Store, sink Sink, interval *time.Duration) *Collector {
+	s.Register(cfg.Label, cfg.UPSName, cfg.Host)
+	return &Collector{cfg: cfg, s: s, sink: sink, interval: interval, fetch: nut.FetchVars}
 }
 
 // Start launches the polling goroutine. It runs until the process exits.
@@ -49,56 +57,23 @@ func (c *Collector) Start() {
 }
 
 func (c *Collector) poll(log *slog.Logger) {
-	vars, err := nut.FetchVars(
+	vars, err := c.fetch(
 		c.cfg.Host, c.cfg.Port, c.cfg.UPSName,
 		c.cfg.TLSMode, c.cfg.TLSSkipVerify,
 		c.cfg.Username, c.cfg.Password,
 	)
+	now := time.Now().UTC()
 	if err != nil {
 		log.Error("poll failed", "err", err)
+		c.s.RecordFailure(c.cfg.Label, err, now)
 		return
 	}
+	log.Debug("poll succeeded", "vars", len(vars))
+	c.s.RecordSuccess(c.cfg.Label, vars, now)
 
-	stats := parseVars(vars, c.cfg.Label, c.cfg.UPSName, c.mappings)
-	c.s.Set(c.cfg.Label, stats)
-
-	if err := c.writer.Write(stats); err != nil {
-		log.Error("influxdb write failed", "err", err)
-	}
-}
-
-// parseVars converts a NUT VarMap into a UpsStats using the configured field mappings.
-// ups.serial is always used to populate Serial (the InfluxDB tag), regardless of mappings.
-func parseVars(vars nut.VarMap, label, upsName string, mappings []config.FieldMapping) *store.UpsStats {
-	s := &store.UpsStats{
-		Label:       label,
-		UpsName:     upsName,
-		CollectedAt: time.Now().UTC(),
-		Serial:      strings.TrimSpace(vars["ups.serial"]),
-		Fields:      make(map[string]any),
-	}
-
-	for _, m := range mappings {
-		rawVal, ok := vars[m.NUTVar]
-		if !ok {
-			continue
-		}
-		rawVal = strings.TrimSpace(rawVal)
-
-		switch m.Type {
-		case "float":
-			if f, err := strconv.ParseFloat(rawVal, 64); err == nil {
-				s.Fields[m.InfluxField] = f
-			}
-		case "int":
-			// Parse as float first to handle values like "3600.0"
-			if f, err := strconv.ParseFloat(rawVal, 64); err == nil {
-				s.Fields[m.InfluxField] = int64(f)
-			}
-		case "string":
-			s.Fields[m.InfluxField] = rawVal
+	if c.sink != nil {
+		if err := c.sink.Write(c.cfg.Label, vars, now); err != nil {
+			log.Error("output write failed", "err", err)
 		}
 	}
-
-	return s
 }

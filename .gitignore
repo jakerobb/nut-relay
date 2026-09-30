@@ -1,5 +1,5 @@
 # Build output
-/src/nut-influx-relay
+/src/nut-relay
 
 # IDE
 .idea/

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"regexp"
@@ -11,14 +13,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Output modes. One per process: run two instances to feed both.
+const (
+	OutputInfluxDB   = "influxdb"
+	OutputPrometheus = "prometheus"
+)
+
 type Config struct {
-	HTTPPort           int            `yaml:"http_port"`
+	// Output is influxdb (the default, so configs from before this setting
+	// existed keep working) or prometheus.
+	Output             string      `yaml:"output"`
+	HTTPPort           int         `yaml:"http_port"`
+	UPSes              []UPSConfig `yaml:"upses"`
+	PollIntervalString string      `yaml:"poll_interval"`
+	PollInterval       *time.Duration
+
+	// influxdb output only.
 	InfluxDB           InfluxDB       `yaml:"influxdb"`
-	UPSes              []UPSConfig    `yaml:"upses"`
 	FieldMappings      []FieldMapping `yaml:"field_mappings"`
 	ExtraFieldMappings []FieldMapping `yaml:"extra_field_mappings"`
-	PollIntervalString string         `yaml:"poll_interval"`
-	PollInterval       *time.Duration
+
+	// prometheus output only. If set, exactly these NUT variables are
+	// exported (ups.status included). Empty means every numeric variable
+	// except DefaultExcludedVariables.
+	Variables []string `yaml:"variables"`
 }
 
 type InfluxDB struct {
@@ -68,6 +86,16 @@ var DefaultFieldMappings = []FieldMapping{
 	{NUTVar: "ups.mfr", InfluxField: "manufacturer", Type: "string"},
 }
 
+// DefaultExcludedVariables are left out of the prometheus output when
+// Variables is empty: numbers that describe the driver or USB device rather
+// than the UPS's state. An entry ending in "." excludes every variable with
+// that prefix.
+var DefaultExcludedVariables = []string{"driver.", "ups.productid", "ups.vendorid"}
+
+// Default config locations, tried in order. The second is where
+// nut-influx-relay (this app's old name) read it.
+var DefaultPaths = []string{"/etc/nut-relay/config.yaml", "/etc/nut-influx-relay/config.yaml"}
+
 var envVarRe = regexp.MustCompile(`\$\{([^}]+)}`)
 
 // interpolate replaces ${VAR_NAME} references with environment variable values.
@@ -87,13 +115,25 @@ func (c *Config) interpolateEnvVars() {
 	}
 }
 
-func Load() (*Config, error) {
-	path := os.Getenv("CONFIG_PATH")
-	if path == "" {
-		path = "/etc/nut-influx-relay/config.yaml"
-	}
+// StaleAfter is how old a UPS's last successful poll can be before its
+// values stop being exported as Prometheus metrics: three missed polls.
+func (c *Config) StaleAfter() time.Duration {
+	return 3 * *c.PollInterval
+}
 
-	return LoadFromPath(path)
+// Load reads the config from CONFIG_PATH if set, else the first of
+// DefaultPaths that exists.
+func Load() (*Config, error) {
+	if path := os.Getenv("CONFIG_PATH"); path != "" {
+		return LoadFromPath(path)
+	}
+	for _, path := range DefaultPaths {
+		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		return LoadFromPath(path)
+	}
+	return nil, fmt.Errorf("no config found at %s", strings.Join(DefaultPaths, " or "))
 }
 
 func LoadFromPath(path string) (*Config, error) {
@@ -113,7 +153,9 @@ func LoadFromPath(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config from path %s: %w", path, err)
 	}
 
-	slog.Debug("loaded config", "token", truncTokenForLogging(cfg.InfluxDB.Token))
+	if cfg.Output == OutputInfluxDB {
+		slog.Debug("loaded config", "token", truncTokenForLogging(cfg.InfluxDB.Token))
+	}
 
 	return &cfg, nil
 }
@@ -143,21 +185,27 @@ func validate(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("invalid poll_interval `%s`: %w", cfg.PollIntervalString, err)
 	}
+	if pollInterval <= 0 {
+		return fmt.Errorf("poll_interval must be positive, got %s", cfg.PollIntervalString)
+	}
 	cfg.PollInterval = &pollInterval
 
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
-	if cfg.InfluxDB.URL == "" {
-		return fmt.Errorf("influxdb.url is required")
+
+	if len(cfg.UPSes) == 0 {
+		return fmt.Errorf("at least one entry in upses is required")
 	}
-	if cfg.InfluxDB.Measurement == "" {
-		cfg.InfluxDB.Measurement = "upsd"
-	}
+	labels := make(map[string]bool)
 	for i, u := range cfg.UPSes {
 		if u.Label == "" {
 			return fmt.Errorf("upses[%d]: label is required", i)
 		}
+		if labels[u.Label] {
+			return fmt.Errorf("upses[%d]: duplicate label %q", i, u.Label)
+		}
+		labels[u.Label] = true
 		if u.Host == "" {
 			return fmt.Errorf("upses[%d]: host is required", i)
 		}
@@ -174,6 +222,29 @@ func validate(cfg *Config) error {
 		} else if !validTLSMode(u.TLSMode) {
 			return fmt.Errorf("upses[%d]: invalid tls_mode %q (must be plain, tls, or starttls)", i, u.TLSMode)
 		}
+	}
+
+	cfg.Output = strings.ToLower(strings.TrimSpace(cfg.Output))
+	switch cfg.Output {
+	case "", OutputInfluxDB:
+		cfg.Output = OutputInfluxDB
+		return validateInfluxDB(cfg)
+	case OutputPrometheus:
+		return validatePrometheus(cfg)
+	default:
+		return fmt.Errorf("invalid output %q (must be %s or %s)", cfg.Output, OutputInfluxDB, OutputPrometheus)
+	}
+}
+
+func validateInfluxDB(cfg *Config) error {
+	if len(cfg.Variables) > 0 {
+		return fmt.Errorf("variables only applies to output: %s (use field_mappings for %s)", OutputPrometheus, OutputInfluxDB)
+	}
+	if cfg.InfluxDB.URL == "" {
+		return fmt.Errorf("influxdb.url is required")
+	}
+	if cfg.InfluxDB.Measurement == "" {
+		cfg.InfluxDB.Measurement = "upsd"
 	}
 
 	if len(cfg.FieldMappings) == 0 {
@@ -194,6 +265,25 @@ func validate(cfg *Config) error {
 		cfg.FieldMappings = append(cfg.FieldMappings, validated...)
 	}
 
+	return nil
+}
+
+// validatePrometheus rejects InfluxDB-only settings rather than ignoring
+// them, so a config that mixes the two fails loudly.
+func validatePrometheus(cfg *Config) error {
+	if cfg.InfluxDB != (InfluxDB{}) {
+		return fmt.Errorf("influxdb only applies to output: %s", OutputInfluxDB)
+	}
+	if len(cfg.FieldMappings) > 0 || len(cfg.ExtraFieldMappings) > 0 {
+		return fmt.Errorf("field_mappings and extra_field_mappings only apply to output: %s (use variables for %s)", OutputInfluxDB, OutputPrometheus)
+	}
+	for i, v := range cfg.Variables {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return fmt.Errorf("variables[%d]: empty variable name", i)
+		}
+		cfg.Variables[i] = v
+	}
 	return nil
 }
 
