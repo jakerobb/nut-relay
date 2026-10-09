@@ -1,6 +1,6 @@
 module github.com/jakerobb/nut-relay
 
-go 1.27
+go 1.27.2
 
 require gopkg.in/yaml.v3 v3.0.1
 
